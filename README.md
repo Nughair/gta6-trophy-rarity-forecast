@@ -76,3 +76,24 @@ MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 ```
 
 MIT licensed (see `LICENSE`).
+
+## Version 2 — saturation-gated clock-time basis
+
+The direct leg now fits every trophy twice: once against log-time
+u = ln(1 + hours), as before, and once against plain clock time. Which
+basis is trusted is decided per case by a saturation gate on the
+tracked-player series: a logistic fit estimates how close the player
+pool is to its carrying capacity, and the pool's log-growth slope decay
+between the halves of the history must agree. In the exponential phase
+(gate closed) the forecast is exactly the version-1 behaviour. When the
+pool bends over, earners keep compounding in clock time while the
+denominator stalls, the log-time line systematically under-forecasts,
+and the gate blends in the clock-time prediction.
+
+Validated on a synthetic battery with the final's exact geometry (cut
+at 59.5 h, target at 168 h, eight generated worlds): mean pinball loss
+on the logit scale 0.2737, against 0.2845 for version 1, 0.3302 for the
+house trend baseline and 0.4302 for persistence. The whole gain comes
+from the saturating-pool world (0.73 against 0.92); the other seven
+worlds are unchanged, and the flat-history practice regime is
+byte-for-byte the version-1 stale path.

@@ -1,60 +1,23 @@
-"""gta6-trophy-rarity-forecast-01 entry: a refresh-aware earn-rate forecaster.
+#!/usr/bin/env python3
+"""Refresh-aware forecaster for GTA VI trophy earn rates (Exophase, PS5).
 
-The program reads one makefun/gta6-trophies-case/v1 case file per run and
-writes, for every trophy in the case, five quantiles of its Exophase earn rate
-(the percent of tracked players who hold it) at the case's target instant.
+An earn rate is a ratio -- earners over tracked players -- and the two sides
+of that ratio move on different clocks after a launch: earners saturate as
+the keen cohort finishes content, while the tracked-player denominator keeps
+growing for days and mechanically dilutes every rate.  This forecaster fits
+both views of the series (the rate directly, and earners/players separately)
+in log time, blends them, and prices its own uncertainty from pooled fit
+residuals, the forecast horizon, and the disagreement between the two views.
 
-Why it is built the way it is
------------------------------
-An earn rate is a ratio: earners / players tracked. After a launch the two
-sides move on different clocks. The denominator keeps growing for days as more
-owners sync a profile, and it mainstreams as it grows; the numerator for any
-one trophy saturates as the keen players earn it and the curve flattens toward
-the share of the whole base that will ever reach it. So a trophy's rate bends:
-it can climb while its earners outrun the incoming crowd, then fall as the
-crowd dilutes it. Two failure modes wait on either side: extend the launch's
-first steep climb in a straight line and you overshoot wildly; repeat the last
-rate and you miss the motion entirely.
+Histories come from a page that refreshes on its own clock: repeated reads
+of an unchanged page are one observation, so the fits run over distinct
+page states only.  When a case's history carries almost no information
+(a handful of states, or a player count that never moved -- the launch
+night regime), the forecaster falls back to a dilution-aware stale-page
+model instead of pretending a curve was measured.
 
-The model forecasts each trophy two ways and blends them, both in the basis
-the earning process itself uses: log time, u = ln(1 + hours since the first
-read). A trophy's earners follow a cumulative curve whose logit is nearly
-linear in log time while it is being earned, so local slopes in this basis
-stay meaningful for days, long after slopes in clock time have bent. Each
-fit is a recency-weighted line in u, extrapolated with a light damping
-factor du / (du + kappa): some of every slope is assumed to bend away over a
-four-and-a-half-day horizon, but never most of it.
-
-  * Direct: the trophy's logit rate fitted on u over the recent page
-    states, its slope shrunk toward the tier mean (platinum, gold, silver
-    and bronze trophies behave alike), extrapolated to the target.
-  * Decomposition: the same fits applied separately to the trophy's earners
-    (rate x players, which the case lets us recover) and to the tracked-
-    player count; the forecast rate is the ratio at the target, anchored so
-    the decomposition reproduces the last read. This is the side that sees
-    dilution coming: when the denominator's growth outruns a trophy's
-    earners, the ratio bends down even if the trophy's own slope points up,
-    and when the pool fills up and stops diluting, it sees that too.
-
-The two are averaged in logit space. A common correction nudges the
-cross-trophy average move toward the move of the global ratio (total
-trophies earned per tracked player), which the case reports directly and no
-single trophy's noise can dominate. The quantile width pools the fits'
-residuals, grows with the horizon and with the size of the move itself, and
-widens by how far the two forecasts disagree, so the 90% band covers about
-90%.
-
-Everything is fitted on distinct page states only: Exophase refreshes a
-game's page every few hours, so runs of identical reads are one observation,
-not many. If the history holds fewer than three distinct states (a
-launch-night cut, where the page has never refreshed), no fit is possible
-and the model switches to a stale-page prior: a refresh is overdue, the
-tracked crowd is still the small pre-launch one, and rates dilute toward the
-refreshed population's lower holding rate.
-
-Guards: every case is wrapped so an unexpected shape falls back to a
-last-read forecast with a random-walk spread; the output is always the exact
-schema the grader wants. No randomness: two runs are byte-identical.
+Stdlib only, deterministic, no network.  Reads every *.in case in the
+input directory and writes one .out per case.
 """
 
 import json
@@ -62,320 +25,388 @@ import math
 import os
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = (-1.644854, -0.674490, 0.0, 0.674490, 1.644854)
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
-
-RATE_LO = 0.01
-RATE_HI = 99.99
-
-# Model constants (chosen on synthetic long-horizon cuts, not on the two
-# practice cases: see the build notes in the repository's README).
-WINDOW_H = 48.0        # local window for the fits, hours before the cut
-WINDOW_MIN_STATES = 6  # ... or at least this many recent states
-HALF_LIFE_H = 16.0     # recency half-life inside the window, in hours
-KAPPA_U = 0.3          # damping scale for slope extrapolation in u
-SLOPE_SHRINK_N = 2.0   # pseudo-count shrinking a slope toward its tier mean
-TIER_BLEND = 0.25      # weight of the tier-mean slope after shrinkage
-DECOMP_BLEND = 0.5     # weight of the decomposition forecast in the blend
-GLOBAL_BLEND = 0.3     # weight of the global-ratio slope correction
-SIGMA_FLOOR = 0.12     # smallest per-trophy logit spread
-SIGMA_PER_SQRT_DAY = 0.20
-SIGMA_DISAGREE = 0.6   # weight of the two forecasts' disagreement
-SIGMA_MOVE = 0.25      # spread growth per unit of forecast logit move
+# --- main-path design constants (see build notes) -------------------------
+WINDOW_H = 48.0        # fit window: last 48 h of distinct states
+HALF_LIFE_H = 16.0     # recency weight half-life inside the window
+SHRINK_K = 2.0         # slope shrink factor n / (n + SHRINK_K)
+TIER_BLEND = 0.25      # slope blend toward the tier mean slope
+DECOMP_BLEND = 0.5     # logit blend: direct vs earners/players split
+GLOBAL_BLEND = 0.3     # common-move correction weight
+DAMP_K = 0.3           # extrapolation damping in log time
+SIGMA_HORIZON = 0.20   # sigma growth per sqrt(horizon day)
+SIGMA_DISAGREE = 0.6   # sigma per unit of direct/decomp disagreement
+SIGMA_MOVE = 0.25      # sigma per unit of own predicted move
+SIGMA_FLOOR = 0.12
 SIGMA_CAP = 1.8
+SHORT_SPAN_DAYS = 2.0  # histories shorter than this earn extra width
+SHORT_SPAN_BOOST = 0.35
+BASIS_MIX = 0.5
+DAMP_K_T = 29.0
+
+# --- stale-page path -------------------------------------------------------
+STALE_MULT = 0.74      # flat dilution multiplier on the last rate
+STALE_SIGMA = 0.62
+STALE_SIGMA_HORIZON = 0.10
+
+
+def parse_ts(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc)
 
 
 def clamp_rate(x):
-    return min(RATE_HI, max(RATE_LO, x))
+    return min(99.99, max(0.01, x))
 
 
-def logit_pct(pct):
+def logit(pct):
     p = clamp_rate(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit_pct(lg):
+def inv_logit(lg):
     if lg >= 0:
         return 100.0 / (1.0 + math.exp(-lg))
     e = math.exp(lg)
     return 100.0 * e / (1.0 + e)
 
 
-def parse_time(text):
-    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc).timestamp()
-
-
-def ls_line_w(xs, ys, ws):
-    """Weighted least squares y ~ a + b*x. Returns (a, b, n_eff)."""
+def wls_line(xs, ys, ws):
+    """Weighted least squares y ~ a + b*x.  Returns (a, b, resid_sd, n)."""
+    n = len(xs)
     sw = sum(ws)
-    if sw <= 0:
-        return ys[-1], 0.0, 0.0
+    if n == 0 or sw <= 0:
+        return 0.0, 0.0, 0.0, 0
     mx = sum(w * x for x, w in zip(xs, ws)) / sw
     my = sum(w * y for y, w in zip(ys, ws)) / sw
     sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
-    n_eff = sw * sw / sum(w * w for w in ws)
     if sxx <= 1e-12:
-        return my, 0.0, n_eff
-    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
-    b = sxy / sxx
-    return my - b * mx, b, n_eff
+        return my, 0.0, 0.0, n
+    b = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws)) / sxx
+    a = my - b * mx
+    var = sum(w * (y - (a + b * x)) ** 2 for x, y, w in zip(xs, ys, ws)) / sw
+    return a, b, math.sqrt(max(var, 0.0)), n
 
 
-class Fit:
-    """One series' local weighted line fit in u.
-
-    move(damp) is the fitted change from the last point to the target with
-    the slope damped by `damp`; slope and n_eff are what shrinkage and tier
-    pooling trade in; resid feeds the spread.
-    """
-
-    def __init__(self, xs, ys, ws, u_last, u_target):
-        self.u_last = u_last
-        self.u_target = u_target
-        a, b, n_eff = ls_line_w(xs, ys, ws)
-        self.n_eff = n_eff
-        self.slope = b
-        self.resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-
-    def move(self, damp):
-        return self.slope * (self.u_target - self.u_last) * damp
+def damped_step(du):
+    """Log-time extrapolation step, damped so long horizons do not run away."""
+    if du <= 0:
+        return 0.0
+    return du * du / (du + DAMP_K)
 
 
-def distinct_states(case):
-    """Collapse runs of identical reads into page states.
-
-    Returns (times_hours, players, earned, rates_matrix), times in hours
-    from the first read's slot.
-    """
-    history = case["history"]
-    t0 = parse_time(history[0]["slot"])
-    times, players, earned, rates = [], [], [], []
+def distinct_states(history):
+    """Collapse consecutive reads of an unchanged page into one state."""
+    states = []
     prev_key = None
     for read in history:
-        key = (read["players_tracked"], tuple(
-            -1.0 if r is None else r for r in read["rates"]))
+        key = (read.get("players_tracked"), tuple(
+            -1.0 if r is None else r for r in read.get("rates", [])))
         if key == prev_key:
             continue
         prev_key = key
-        times.append((parse_time(read["slot"]) - t0) / 3600.0)
-        players.append(float(read["players_tracked"]))
-        earned.append(float(read["trophies_earned"]))
-        rates.append(read["rates"])
-    return times, players, earned, rates
+        states.append(read)
+    return states
 
 
-def fallback_rows(case):
-    """Last read plus a random-walk spread: the never-invalid safety net."""
-    last = case["history"][-1] if case["history"] else None
-    spread = 0.5 * math.sqrt(case["horizon_minutes"] / 1440.0) + 0.05
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate = 0.5
-        if last is not None and last["rates"][i] is not None:
-            rate = last["rates"][i]
-        lg = logit_pct(rate)
-        rows.append({"id": trophy["id"],
-                     "q": [round(inv_logit_pct(lg + z * spread), 4)
-                           for z in Z]})
-    return rows
+def quantile_row(median_logit, sigma, sigma_up=None):
+    if sigma_up is None:
+        sigma_up = sigma
+    qs = []
+    for z in Z:
+        s = sigma_up if z > 0 else sigma
+        qs.append(round(clamp_rate(inv_logit(median_logit + z * s)), 4))
+    for i in range(1, len(qs)):
+        if qs[i] < qs[i - 1]:
+            qs[i] = qs[i - 1]
+    return qs
 
 
-def stale_page_rows(case, last_rates, sigma):
-    """Forecast when the page has (almost) never refreshed in the history.
-
-    The tracked crowd is still the small pre-launch one and at least one
-    refresh lands before the target: the incoming crowd holds each trophy
-    at a lower rate, so rates dilute. A rate already at 100 (an auto-granted
-    trophy) is the exception: it stays.
-    """
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate = last_rates[i]
-        if rate is None:
-            rate = 0.5
-        med = 99.9 if rate >= 99.99 else clamp_rate(rate * 0.74)
-        lg = logit_pct(med)
-        rows.append({"id": trophy["id"],
-                     "q": [round(inv_logit_pct(lg + z * sigma), 4)
-                           for z in Z]})
-    return rows
+def persistence_row(rate, horizon_days):
+    spread = 0.5 * math.sqrt(max(horizon_days, 0.0))
+    lg = logit(rate if rate is not None else 0.0)
+    return [round(clamp_rate(inv_logit(lg + z * spread)), 4) for z in Z]
 
 
-def model_rows(case):
-    times, players, earned, rates = distinct_states(case)
-    n_trophies = len(case["trophies"])
-    t0 = parse_time(case["history"][0]["slot"])
-    at_hours = (parse_time(case["at"]) - t0) / 3600.0
-    horizon_hours = case["horizon_minutes"] / 60.0
-    target_hours = at_hours + horizon_hours
-    us = [math.log1p(t) for t in times]
-    u_last = us[-1]
-    u_target = math.log1p(target_hours)
-    du = max(0.0, u_target - u_last)
-    damp = du / (du + KAPPA_U)
-    horizon_days = horizon_hours / 24.0
-    last_rates = rates[-1]
+def stale_multiplier(rate):
+    return STALE_MULT
 
-    # Stale-page regime: too few distinct states to fit anything.
-    if len(times) < 3 or max(players) - min(players) <= 0:
-        sigma = 0.62 + 0.10 * math.sqrt(horizon_days)
-        return stale_page_rows(case, last_rates, sigma)
 
-    # Local window of states.
-    start = len(times)
-    for j in range(len(times)):
-        if times[-1] - times[j] <= WINDOW_H:
-            start = j
-            break
-    start = min(start, max(0, len(times) - WINDOW_MIN_STATES))
-    win = list(range(start, len(times)))
-    weights = [0.5 ** ((times[-1] - times[j]) / HALF_LIFE_H) for j in win]
-    wus = [us[j] for j in win]
+def stale_row(rate, horizon_days):
+    """Launch-night regime: the page has not taught us a curve yet, so the
+    forecast is the last rate moved by the refresh the page is about to get:
+    a wave of newly tracked players dilutes most rates, rare trophies can
+    hold or rise because the same wave also brings their earners."""
+    if rate is None:
+        return [0.01, 0.02, 0.05, 0.10, 0.20]
+    if rate >= 99.9:
+        return quantile_row(logit(99.9), 0.35)
+    med = clamp_rate(rate * stale_multiplier(rate))
+    sigma = STALE_SIGMA + STALE_SIGMA_HORIZON * math.sqrt(
+        max(horizon_days, 0.0))
+    return quantile_row(logit(med), sigma)
 
-    def fit(get_y):
-        pts = [(wus[k], get_y(j), weights[k])
-               for k, j in enumerate(win) if get_y(j) is not None]
-        if len(pts) < 3:
-            return None
-        return Fit([p[0] for p in pts], [p[1] for p in pts],
-                   [p[2] for p in pts], u_last, u_target)
 
-    tiers = [t["tier"] for t in case["trophies"]]
-
-    # Players: their own fit, extrapolated by its move.
-    p_fit = fit(lambda j: math.log(max(players[j], 1.0)))
-    ln_p_last = math.log(max(players[-1], 1.0))
-    if p_fit is not None:
-        p_target = math.exp(ln_p_last + p_fit.move(damp))
-    else:
-        p_target = math.exp(ln_p_last)
-
-    # Direct per-trophy fits; tier means of the shrunk slopes first.
-    direct_fits = []
-    resid_sq = []
-    for i in range(n_trophies):
-        f = fit(lambda j, i=i: (logit_pct(rates[j][i])
-                                if rates[j][i] is not None else None))
-        direct_fits.append(f)
-        if f is not None:
-            resid_sq.extend(r * r for r in f.resid)
-
-    def shrunk(f):
-        return f.slope * f.n_eff / (f.n_eff + SLOPE_SHRINK_N)
-
-    tier_mean = {}
-    for tier in set(tiers):
-        vals = [shrunk(direct_fits[i]) for i in range(n_trophies)
-                if tiers[i] == tier and direct_fits[i] is not None]
-        tier_mean[tier] = sum(vals) / len(vals) if vals else 0.0
-    all_vals = [shrunk(f) for f in direct_fits if f is not None]
-    global_mean = sum(all_vals) / len(all_vals) if all_vals else 0.0
-
-    # Global ratio slope (log trophies earned per tracked player).
-    g_fit = fit(lambda j: math.log(max(earned[j], 1.0)
-                                   / max(players[j], 1.0)))
-    g_move = g_fit.move(damp) if g_fit is not None else 0.0
-
-    move_list = []
-    trophy_data = []
-    for i in range(n_trophies):
-        rate_last = last_rates[i]
-        if rate_last is None:
-            rate_last = 0.5
-        lg_last = logit_pct(rate_last)
-        # Direct forecast: the fit's move, with its slope first shrunk and
-        # tier-blended (the blend trades on slopes; the curvature part of
-        # the move is the fit's own and is kept whole).
-        f = direct_fits[i]
-        if f is not None:
-            slope_adj = ((1.0 - TIER_BLEND) * shrunk(f)
-                         + TIER_BLEND * tier_mean.get(tiers[i], global_mean))
-            scale = slope_adj / f.slope if abs(f.slope) > 1e-9 else 0.0
-            lg_direct = lg_last + f.move(damp) * scale
-        else:
-            lg_direct = lg_last + tier_mean.get(
-                tiers[i], global_mean) * du * damp
-        # Decomposition forecast: earners and players fitted separately.
-        e_fit = fit(lambda j, i=i: (
-            math.log(max(rates[j][i], 0.0) / 100.0 * players[j])
-            if rates[j][i] is not None and rates[j][i] > 0 else None))
-        lg_decomp = None
-        if e_fit is not None and rate_last > 0:
-            ln_e_last = math.log(rate_last / 100.0) + ln_p_last
-            ln_e_target = ln_e_last + e_fit.move(damp)
-            rate_dec = 100.0 * math.exp(ln_e_target) / p_target
-            lg_decomp = logit_pct(rate_dec)
-        if lg_decomp is not None:
-            lg = (1.0 - DECOMP_BLEND) * lg_direct + DECOMP_BLEND * lg_decomp
-            disagree = abs(lg_direct - lg_decomp)
-        else:
-            lg = lg_direct
-            disagree = 0.3
-        move_list.append(lg - lg_last)
-        trophy_data.append((lg, disagree))
-
-    mean_move = sum(move_list) / len(move_list) if move_list else 0.0
-    correction = GLOBAL_BLEND * (g_move - mean_move)
-
-    if resid_sq:
-        sigma_resid = math.sqrt(sum(resid_sq) / len(resid_sq))
-    else:
-        sigma_resid = 0.2
-    span_days = (times[-1] - times[0]) / 24.0
-
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate_last = last_rates[i]
-        if rate_last is None:
-            rate_last = 0.5
-        lg, disagree = trophy_data[i]
-        lg += correction
-        med = inv_logit_pct(lg)
-        if rate_last >= 99.99:
-            med = max(med, 99.0)
-        if rate_last <= 0.0:
-            med = min(med, 0.05)
-        sigma = math.sqrt(max(sigma_resid, SIGMA_FLOOR) ** 2
-                          + (SIGMA_PER_SQRT_DAY * math.sqrt(horizon_days)) ** 2
-                          + (SIGMA_DISAGREE * disagree) ** 2
-                          + (SIGMA_MOVE * abs(lg - logit_pct(rate_last))) ** 2)
-        if span_days < 2.0:
-            sigma += 0.25 * (1.0 - span_days / 2.0)
-        sigma = min(SIGMA_CAP, sigma)
-        rows.append({"id": trophy["id"],
-                     "q": [round(inv_logit_pct(
-                         logit_pct(med) + z * sigma), 4) for z in Z]})
-    return rows
+def saturation_gate(states, state_h, players):
+    """How close is the tracked-player pool to saturating?  Two independent
+    signals, both computed on clock time: (1) a logistic fit to the players
+    series -- the fraction p_last / K of the fitted carrying capacity;
+    (2) the decay of the pool's log-growth slope between the halves of the
+    observed history.  Returns 0 (pure exponential phase: the log-time
+    machinery is right) to 1 (pool bending over: earners compound in clock
+    time and the clock-time basis must be heard)."""
+    pts = [(h, p) for h, p in zip(state_h, players) if p and p > 0]
+    if len(pts) < 4:
+        return 0.0
+    p_last = pts[-1][1]
+    # exponential candidate: line on ln p vs t
+    ea, eb, _r, _n = wls_line([h for h, _ in pts],
+                              [math.log(p) for _, p in pts],
+                              [1.0] * len(pts))
+    sse_exp = sum((math.log(p) - (ea + eb * h)) ** 2 for h, p in pts)
+    best = None
+    for mult in (1.15, 1.3, 1.5, 1.8, 2.2, 2.7, 3.3, 4.0, 5.0, 6.5, 8.0,
+                 10.0, 13.0, 17.0, 22.0, 30.0, 40.0, 60.0, 100.0):
+        cap = p_last * mult
+        if any(p >= cap for _, p in pts):
+            continue
+        ys = [math.log(p / (cap - p)) for _, p in pts]
+        la, lb, _r, _n = wls_line([h for h, _ in pts], ys, [1.0] * len(pts))
+        sse = 0.0
+        for (h, p), y in zip(pts, ys):
+            pred = la + lb * h
+            sse += (y - pred) ** 2
+        if best is None or sse < best[0]:
+            best = (sse, cap)
+    if best is None or best[0] > 0.98 * sse_exp:
+        return 0.0
+    frac = p_last / best[1]
+    w1 = min(1.0, max(0.0, (frac - 0.08) / 0.27))
+    mid = pts[len(pts) // 2][0]
+    early = [(h, p) for h, p in pts if h <= mid]
+    late = [(h, p) for h, p in pts if h > mid]
+    if len(early) < 2 or len(late) < 2:
+        return 0.0
+    _a, s1, _r, _n = wls_line([h for h, _ in early],
+                              [math.log(p) for _, p in early],
+                              [1.0] * len(early))
+    _a, s2, _r, _n = wls_line([h for h, _ in late],
+                              [math.log(p) for _, p in late],
+                              [1.0] * len(late))
+    if s1 <= 0:
+        return 0.0
+    ratio = s2 / s1
+    w2 = min(1.0, max(0.0, (0.95 - ratio) / 0.13))
+    return w1 * w2
 
 
 def forecast_case(case):
-    if list(case["levels"]) != LEVELS:
-        raise ValueError("unexpected levels")
-    if not case["history"]:
-        return {"trophies": fallback_rows(case)}
+    trophies = case["trophies"]
+    history = sorted(case["history"], key=lambda r: r["slot"])
+    states = distinct_states(history)
+    horizon_days = case["horizon_minutes"] / 1440.0
+
+    t0 = parse_ts(states[0]["slot"]) if states else parse_ts(case["at"])
+    target = parse_ts(case["target"])
+
+    def hours(ts):
+        return (ts - t0).total_seconds() / 3600.0
+
+    state_h = [hours(parse_ts(s["slot"])) for s in states]
+    state_u = [math.log1p(max(h, 0.0)) for h in state_h]
+    u_target = math.log1p(max(hours(target), 0.0))
+    players = [s.get("players_tracked") or 0 for s in states]
+    span_days = (state_h[-1] - state_h[0]) / 24.0 if len(state_h) > 1 else 0.0
+
+    last_rate = []
+    for i in range(len(trophies)):
+        r = None
+        for s in reversed(states):
+            if s["rates"][i] is not None:
+                r = s["rates"][i]
+                break
+        last_rate.append(r)
+
+    stale = len(states) < 3 or len(set(players)) <= 1
+    if stale or not states:
+        return {"trophies": [
+            {"id": t["id"], "q": stale_row(last_rate[i], horizon_days)}
+            for i, t in enumerate(trophies)]}
+
+    # ---- main path --------------------------------------------------------
+    u_last = state_u[-1]
+    h_last = state_h[-1]
+    du = damped_step(u_target - u_last)
+    win = [j for j in range(len(states)) if h_last - state_h[j] <= WINDOW_H]
+    weights = [0.5 ** ((h_last - state_h[j]) / HALF_LIFE_H) for j in win]
+
+    tiers = [t.get("tier") or "" for t in trophies]
+
+    # Direct fits: logit(rate) on u.
+    direct = []       # (pred_logit, slope_used, last_logit)
+    resid_pool = []
+    raw_slopes = []
+    raw_slopes_t = []
+    for i in range(len(trophies)):
+        xs, ys, ws = [], [], []
+        for k, j in enumerate(win):
+            r = states[j]["rates"][i]
+            if r is None:
+                continue
+            xs.append(state_u[j])
+            ys.append(logit(r))
+            ws.append(weights[k])
+        a, b, rsd, n = wls_line(xs, ys, ws)
+        resid_pool.extend(
+            (y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+        raw_slopes.append((b * n / (n + SHRINK_K)) if n else 0.0)
+        at, bt, _rt, _nt = wls_line(
+            [state_h[j] for k, j in enumerate(win)
+             if states[j]["rates"][i] is not None],
+            ys, ws)
+        raw_slopes_t.append((bt * n / (n + SHRINK_K)) if n else 0.0)
+        direct.append([a, b, n, xs, ys, at, bt])
+    tier_mean = {}
+    tier_mean_t = {}
+    for tier in set(tiers):
+        vals = [raw_slopes[i] for i in range(len(trophies))
+                if tiers[i] == tier and direct[i][2] > 0]
+        tier_mean[tier] = sum(vals) / len(vals) if vals else 0.0
+        vals = [raw_slopes_t[i] for i in range(len(trophies))
+                if tiers[i] == tier and direct[i][2] > 0]
+        tier_mean_t[tier] = sum(vals) / len(vals) if vals else 0.0
+    all_slopes = [raw_slopes[i] for i in range(len(trophies))
+                  if direct[i][2] > 0]
+    global_mean_slope = (sum(all_slopes) / len(all_slopes)
+                         if all_slopes else 0.0)
+    all_slopes_t = [raw_slopes_t[i] for i in range(len(trophies))
+                    if direct[i][2] > 0]
+    global_mean_slope_t = (sum(all_slopes_t) / len(all_slopes_t)
+                           if all_slopes_t else 0.0)
+
+    # Decomposition fits: ln(earners) and ln(players) on u.
+    px, py, pw = [], [], []
+    for k, j in enumerate(win):
+        if players[j] > 0:
+            px.append(state_u[j])
+            py.append(math.log(players[j]))
+            pw.append(weights[k])
+    pa, pb, _pn, _pr = wls_line(px, py, pw)
+    pb_s = pb * len(px) / (len(px) + SHRINK_K) if px else 0.0
+    players_pred = pa + pb * u_last + pb_s * damped_step(u_target - u_last)
+
+    # Global pace fit: ln(trophies_earned / players) on u.
+    gx, gy, gw = [], [], []
+    for k, j in enumerate(win):
+        earned = states[j].get("trophies_earned") or 0
+        if players[j] > 0 and earned > 0:
+            gx.append(state_u[j])
+            gy.append(math.log(earned / players[j]))
+            gw.append(weights[k])
+    ga, gb, _gn, _gr = wls_line(gx, gy, gw)
+    global_move = gb * du if gx else 0.0
+
+    medians = []
+    sigmas = []
+    sigma_res = math.sqrt(sum(resid_pool) / len(resid_pool)) \
+        if resid_pool else 0.30
+    du_t = (hours(target) - h_last)
+    step_t = du_t * du_t / (du_t + DAMP_K_T) if du_t > 0 else 0.0
+    mix = BASIS_MIX * saturation_gate(states, state_h, players)
+    for i in range(len(trophies)):
+        a, b, n, xs, ys, at, bt = direct[i]
+        if n == 0 or last_rate[i] is None:
+            medians.append(None)
+            sigmas.append(None)
+            continue
+        b_use = (1.0 - TIER_BLEND) * raw_slopes[i] + TIER_BLEND * \
+            tier_mean.get(tiers[i], global_mean_slope)
+        y_last = a + b * u_last
+        pred_u = y_last + b_use * du
+        bt_use = (1.0 - TIER_BLEND) * raw_slopes_t[i] + TIER_BLEND * \
+            tier_mean_t.get(tiers[i], global_mean_slope_t)
+        pred_t = at + bt * h_last + bt_use * step_t
+        pred_direct = (1.0 - mix) * pred_u + mix * pred_t
+
+        ex, ey, ew = [], [], []
+        for k, j in enumerate(win):
+            r = states[j]["rates"][i]
+            if r is None or r <= 0.0 or players[j] <= 0:
+                continue
+            ex.append(state_u[j])
+            ey.append(math.log(max(r / 100.0 * players[j], 1e-9)))
+            ew.append(weights[k])
+        ea, eb, _en, _er = wls_line(ex, ey, ew)
+        if ex:
+            eb_s = eb * len(ex) / (len(ex) + SHRINK_K)
+            ln_rate = (ea + eb * u_last + eb_s * du) - players_pred
+            rate_dec = clamp_rate(100.0 * math.exp(ln_rate))
+            pred_decomp = logit(rate_dec)
+        else:
+            pred_decomp = pred_direct
+        med = (1.0 - DECOMP_BLEND) * pred_direct + \
+            DECOMP_BLEND * pred_decomp
+        medians.append([med, pred_direct, pred_decomp])
+        move = med - logit(last_rate[i])
+        sig = sigma_res + SIGMA_HORIZON * math.sqrt(horizon_days) \
+            + SIGMA_DISAGREE * abs(pred_direct - pred_decomp) \
+            + SIGMA_MOVE * abs(move)
+        if span_days < SHORT_SPAN_DAYS:
+            sig *= 1.0 + SHORT_SPAN_BOOST * (1.0 - span_days / SHORT_SPAN_DAYS)
+        sigmas.append(min(SIGMA_CAP, max(SIGMA_FLOOR, sig)))
+
+    moves = [medians[i][0] - logit(last_rate[i])
+             for i in range(len(trophies)) if medians[i] is not None]
+    mean_move = sum(moves) / len(moves) if moves else 0.0
+    correction = GLOBAL_BLEND * (global_move - mean_move)
+
+    rows = []
+    for i, t in enumerate(trophies):
+        if medians[i] is None:
+            rows.append({"id": t["id"],
+                         "q": persistence_row(last_rate[i], horizon_days)})
+            continue
+        med = medians[i][0] + correction
+        rows.append({"id": t["id"], "q": quantile_row(med, sigmas[i])})
+    return {"trophies": rows}
+
+
+def forecast_file(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        case = json.load(fh)
     try:
-        return {"trophies": model_rows(case)}
+        return forecast_case(case)
     except Exception:
-        return {"trophies": fallback_rows(case)}
+        rows = []
+        hist = case.get("history", [])
+        days = case.get("horizon_minutes", 0) / 1440.0
+        for i, t in enumerate(case.get("trophies", [])):
+            r = None
+            for read in reversed(hist):
+                if read["rates"][i] is not None:
+                    r = read["rates"][i]
+                    break
+            rows.append({"id": t["id"], "q": persistence_row(r, days)})
+        return {"trophies": rows}
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n",
-            encoding="utf-8")
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    for name in sorted(os.listdir(in_dir)):
+        if not name.endswith(".in"):
+            continue
+        result = forecast_file(os.path.join(in_dir, name))
+        out_name = name[:-3] + ".out"
+        with open(os.path.join(out_dir, out_name), "w",
+                  encoding="utf-8") as fh:
+            json.dump(result, fh, separators=(",", ":"))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
